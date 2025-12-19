@@ -421,15 +421,6 @@ Current Status: **Stage 2-3 (Proactive to Predictive)**
 
 ---
 
-## 📞 Contact Information
-
-For questions about this documentation:
-- **Email:** devteam@crismac.com
-- **Slack:** #observability-help
-- **Wiki:** [Internal Wiki Link]
-
----
-
 **Happy Monitoring! 📊✨**
 
 *Remember: Good observability leads to better software, faster debugging, and happier users.*
