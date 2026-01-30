@@ -1,4 +1,4 @@
-# EWS Core API Observability Documentation
+# ENSURE DCMS2.0 and EWS Core API Observability Documentation
 
 ## Complete Guide to Application Monitoring and Observability
 
