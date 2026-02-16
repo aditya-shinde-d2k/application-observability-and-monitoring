@@ -158,7 +158,7 @@ OTLP Collector
 | **ApplicationTelemetry** | [Telemetry/ApplicationTelemetry.cs](Telemetry/ApplicationTelemetry.cs) | Defines all custom RED metrics counters and histograms |
 | **RedMetricsMiddleware** | [Middleware/RedMetricsMiddleware.cs](Middleware/RedMetricsMiddleware.cs) | Automatically records Rate, Error, Duration for every HTTP request |
 | **GlobalExceptionHandler** | [Helpers/GlobalExceptionHandler.cs](Helpers/GlobalExceptionHandler.cs) | Catches unhandled exceptions; returns ProblemDetails with TraceId |
-| **OpenTelemetrySettings** | [Helpers/OpenTelemetrySettings.cs](Helpers/OpenTelemetrySettings.cs) | Configuration model; holds excluded paths and OTLP endpoint |
+| **OpenTelemetrySettings** | [Telemetry/OpenTelemetrySettings.cs](Telemetry/OpenTelemetrySettings.cs) | Configuration model; holds excluded paths and OTLP endpoint |
 | **DiagnosticsController** | [Controllers/DiagnosticsController.cs](Controllers/DiagnosticsController.cs) | Test endpoints for validating the full OTEL integration |
 
 ---
@@ -180,8 +180,8 @@ OTLP Collector
 <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.10.1"      />
 <PackageReference Include="OpenTelemetry.Instrumentation.Http"       Version="1.11.0"      />
 <PackageReference Include="OpenTelemetry.Instrumentation.SqlClient"  Version="1.9.0-beta.1"/>
-<PackageReference Include="OpenTelemetry.Instrumentation.Runtime"    Version="1.11.0"      />
-<PackageReference Include="OpenTelemetry.Instrumentation.Process"    Version="0.5.0-beta.6"/>
+<PackageReference Include="OpenTelemetry.Instrumentation.Runtime"    Version="1.11.0"       />
+<PackageReference Include="OpenTelemetry.Instrumentation.Process"    Version="0.5.0-beta.6" />
 ```
 
 **Serilog OTEL Integration:**
@@ -203,7 +203,7 @@ OTLP Collector
 Provides a single `AddOpenTelemetryObservability()` extension method that wires up:
 - Resource attributes (service name, version, environment, host)
 - Tracing pipeline: ASP.NET Core → HttpClient → SqlClient → OTLP exporter
-- Metrics pipeline: ASP.NET Core → Runtime → custom `ApplicationTelemetry.Meter` → OTLP exporter
+- Metrics pipeline: ASP.NET Core → HttpClient → Runtime → Process → custom `ApplicationTelemetry.Meter` → OTLP exporter
 
 #### `Telemetry/ApplicationTelemetry.cs`
 Central registry for all custom metrics. Exposes static counters and histograms:
@@ -218,23 +218,47 @@ Central registry for all custom metrics. Exposes static counters and histograms:
 
 Also exposes `ApplicationTelemetry.ActivitySource` for adding custom spans anywhere in the codebase.
 
+**Phase 2 metrics (guarded by `#if PHASE2`):** Login analytics instruments (`auth_login_attempts_total`, `auth_login_success_total`, `auth_login_failures_total`, `auth_login_duration_milliseconds`, `auth_otp_generation_duration_milliseconds`) are defined but compiled out. To enable, add `<DefineConstants>PHASE2</DefineConstants>` to the project file and call them from the authentication flow.
+
 #### `Middleware/RedMetricsMiddleware.cs`
-Wraps every request and records the three RED metrics. Key design decision:
+Wraps every request and records the three RED metrics. Key design decisions:
 
 ```csharp
-// Uses Response.OnCompleted callback instead of a try/finally around _next()
-// This guarantees we capture the FINAL status code after GlobalExceptionHandler
-// has written the 500 response — not before.
+// 1. exceptionPropagated flag — guards against a race condition where
+//    ExceptionHandlerMiddleware calls response.Clear() (resetting StatusCode to 200)
+//    before re-writing the 500. If OnCompleted fires in that window, the error
+//    would be silently swallowed. The flag prevents that.
+var exceptionPropagated = false;
+
 context.Response.OnCompleted(() =>
 {
     stopwatch.Stop();
-    RecordMetrics(context, endpoint, method, stopwatch.Elapsed.TotalMilliseconds);
-    ApplicationTelemetry.ActiveRequests.Add(-1, ...);
+
+    // Use context status code, but override to 500 if an exception propagated
+    // and the code hasn't been updated into the error range yet.
+    var effectiveStatusCode = context.Response.StatusCode;
+    if (exceptionPropagated && effectiveStatusCode < 400)
+        effectiveStatusCode = StatusCodes.Status500InternalServerError;
+
+    RecordMetrics(context, endpoint, method, stopwatch.Elapsed.TotalMilliseconds, effectiveStatusCode);
+    ApplicationTelemetry.ActiveRequests.Add(-1, new KeyValuePair<string, object?>("http_method", method));
     return Task.CompletedTask;
 });
 
-await _next(context);   // Does NOT wrap in try/catch — lets exceptions propagate
+// 2. try/catch only to SET the flag — exception is always re-thrown.
+//    ExceptionHandlerMiddleware (outer) still handles it; the app is NOT catching silently.
+try
+{
+    await _next(context);
+}
+catch
+{
+    exceptionPropagated = true;
+    throw;   // ← re-throws; GlobalExceptionHandler still runs
+}
 ```
+
+> **Why `statusCode` is passed explicitly to `RecordMetrics`:** The callback receives `effectiveStatusCode` as a local, not `context.Response.StatusCode`, so the 500-fallback override is preserved even after the response object is mutated.
 
 Also uses `GetEndpointTemplate()` to extract route patterns like `/api/users/{id}` instead of `/api/users/123`, preventing **high-cardinality** metric explosions.
 
@@ -248,20 +272,40 @@ What it does for every unhandled exception:
 4. Returns a safe `ProblemDetails` JSON response with `traceId` included
 5. Maps known exception types to correct HTTP status codes (400/404/500)
 
-#### `Helpers/OpenTelemetrySettings.cs`
-POCO that binds the `"OpenTelemetry"` section from `appsettings.json`. Provides `IsPathExcluded(path)` helper with wildcard support, used by both `RequestResponseLoggingMiddleware` and `RedMetricsMiddleware` for consistent path filtering.
+#### `Telemetry/OpenTelemetrySettings.cs`
+POCO that binds the `"OpenTelemetry"` section from `appsettings.json`. Provides `IsPathExcluded(path)` used by both `RequestResponseLoggingMiddleware` and `RedMetricsMiddleware` for consistent path filtering.
+
+`IsPathExcluded` supports three matching strategies (case-insensitive):
+
+| Strategy | When used | Example |
+|----------|-----------|---------|
+| **Prefix (StartsWith)** | Pattern has no `*` or `?` | `"/swagger"` matches `/swagger`, `/swagger/index.html` |
+| **Wildcard** | Pattern contains `*` or `?` | `"/api/*/logs"` matches `/api/admin/logs`, `/api/user/logs` |
+| **Exact** | Single-segment pattern with no wildcards | `"/health"` still uses prefix so matches `/health` only (no trailing path expected) |
+
+Common patterns:
+```json
+"ExcludedPaths": [
+  "/health",                                        // prefix: /health*
+  "/swagger",                                       // prefix: /swagger*
+  "/api/generatetoken",                             // prefix: /api/generatetoken*
+  "/api/getcurrenttimekey",
+  "/api/UserLoginDetails/CrisMAc/AppLogsUpdate",    // exact-ish prefix
+  "/api/diagnostics"                                // exclude entire diagnostics controller
+]
+```
 
 #### `Controllers/DiagnosticsController.cs`
 Test-only controller. Should be **removed or secured before production**. Endpoints:
 
 | Endpoint | Triggers |
 |----------|---------|
-| `GET /api/diagnostics/test-otel` | Logs at Info/Warn/Error levels; returns TraceId |
-| `POST /api/diagnostics/test-validation` | Model validation failure (400) |
-| `GET /api/diagnostics/test-handled-exception` | Controller-caught exception |
-| `GET /api/diagnostics/test-unhandled-exception` | Unhandled exception → GlobalExceptionHandler |
-| `GET /api/diagnostics/test-error` | Manual 500 response with TraceId |
-| `GET /api/diagnostics/health` | Simple health check |
+| `GET /api/diagnostics/test-otel` | Logs at Info/Warn/Error levels via `ILogger` and `Serilog.Log` direct; returns TraceId + Loki/Tempo query hints |
+| `GET /api/diagnostics/test-response` | Returns a `RequestResult` success response with `TraceId` field populated — validates the `RequestResult` model |
+| `GET /api/diagnostics/test-error` | Returns a `RequestResult` 500 response with `TraceId` field populated |
+| `GET /api/diagnostics/test-validation-error` | Triggers `ValidationProblemDetails` (400) via `[Required]` + `[EmailAddress]` on a query-string model; sets `IsValidationError=true` |
+| `GET /api/diagnostics/test-handled-exception` | Controller-caught `InvalidOperationException`; returns `RequestResult` 500 with trace; span stays green (caught) |
+| `GET /api/diagnostics/test-unhandled-exception` | Unhandled `InvalidOperationException` → `GlobalExceptionHandler`; span marked error in Tempo |
 
 ---
 
@@ -511,7 +555,9 @@ Program.cs
 │         │   └─ OTLP exporter → Tempo
 │         └─ Metrics pipeline
 │             ├─ AspNetCore auto-instrumentation
+│             ├─ HttpClient auto-instrumentation
 │             ├─ Runtime auto-instrumentation
+│             ├─ Process auto-instrumentation (CPU, memory, threads)
 │             ├─ ApplicationTelemetry.Meter (custom RED metrics)
 │             └─ OTLP exporter → Mimir/Prometheus
 │
@@ -615,8 +661,9 @@ Incoming HTTP Request
 ├─ Exception bubbles up through middleware stack:
 │   ├─ RedMetricsMiddleware.InvokeAsync
 │   │   └─ await _next() throws
-│   │   └─ NOT caught → propagates
+│   │   └─ catch block: exceptionPropagated = true; throw; ← re-throws, NOT swallowed
 │   │   └─ Response.OnCompleted still registered ✅
+│   │   └─ OnCompleted uses effectiveStatusCode=500 because exceptionPropagated=true ✅
 │   │
 │   └─ RequestResponseLoggingMiddleware.Invoke
 │       └─ await _next() throws
@@ -645,6 +692,7 @@ Incoming HTTP Request
 │           }
 │
 └─ Response.OnCompleted fires → RecordMetrics()
+    ├─ effectiveStatusCode = context.Response.StatusCode (or 500 if exceptionPropagated)
     ├─ HttpRequestsTotal.Add(1, {method, route, 500})           ← RATE (all requests counted)
     ├─ HttpRequestDuration.Record(elapsed, {method, route, 500})← DURATION
     ├─ status >= 400 → HttpRequestErrors.Add(1, {error.type="server_error"}) ← ERRORS
@@ -774,11 +822,11 @@ Set `"Enabled": false` — the `AddOpenTelemetryObservability()` method checks t
 | Endpoint | Method | What to Verify |
 |----------|--------|----------------|
 | `GET /api/diagnostics/test-otel` | GET | TraceId in response + logs in Loki + span in Tempo |
-| `POST /api/diagnostics/test-validation` | POST | 400 response with `errors` + `traceId`; `api_validation_errors_total` incremented |
-| `GET /api/diagnostics/test-handled-exception` | GET | 500 response from controller catch; full exception in server logs |
-| `GET /api/diagnostics/test-unhandled-exception` | GET | ProblemDetails 500 from GlobalExceptionHandler; span marked as error in Tempo |
-| `GET /api/diagnostics/test-error` | GET | Custom error response with TraceId |
-| `GET /api/diagnostics/health` | GET | Simple 200 (should NOT appear in traces — excluded path) |
+| `GET /api/diagnostics/test-response` | GET | `RequestResult` body includes `traceId` field; `http_server_requests_total` incremented with status 200 |
+| `GET /api/diagnostics/test-error` | GET | `RequestResult` body includes `traceId`; status 500 counted as server error in metrics |
+| `GET /api/diagnostics/test-validation-error?email=bad` | GET | 400 `ValidationProblemDetails` with field-level errors + `traceId`; `api_validation_errors_total` incremented |
+| `GET /api/diagnostics/test-handled-exception` | GET | 500 `RequestResult` from controller catch; exception logged with stack trace but span stays healthy (exception was caught) |
+| `GET /api/diagnostics/test-unhandled-exception` | GET | `ProblemDetails` 500 from `GlobalExceptionHandler`; span marked as error in Tempo; `exceptionPropagated=true` forces 500 in RED metrics |
 
 ### Step-by-Step Correlation Test
 
@@ -1000,4 +1048,13 @@ A: They are not authenticated and deliberately throw exceptions and log at all l
 
 ---
 
-*Document Version: 1.0 | Branch: feature/add-otel-grafana-observability*
+*Document Version: 1.1 | Branch: feature/add-otel-grafana-observability | Updated: 2026-02-16*
+
+**Changelog v1.1:**
+- Fixed `OpenTelemetrySettings` file path (`Helpers/` → `Telemetry/`)
+- Updated `RedMetricsMiddleware` design: documented `exceptionPropagated` flag, `effectiveStatusCode` override, and explicit `statusCode` param to `RecordMetrics`
+- Updated `DiagnosticsController` endpoint table: reflected actual endpoints (`test-validation-error`, `test-response`; removed non-existent `health` and `POST test-validation`)
+- Added `ProcessInstrumentation` to packages list and metrics pipeline
+- Expanded `OpenTelemetrySettings.IsPathExcluded` docs: prefix / wildcard matching modes with examples
+- Added Phase 2 login-analytics metrics note (`#if PHASE2` compile guard)
+- Updated error-path execution flow to show `exceptionPropagated = true; throw;` pattern
